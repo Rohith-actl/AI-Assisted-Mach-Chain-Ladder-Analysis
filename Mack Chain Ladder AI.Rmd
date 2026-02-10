@@ -1,0 +1,1477 @@
+---
+title: "AI-Augmented Actuarial Reporting Pipeline"
+author: "Rohith Narayanan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_folding: hide
+runtime: shiny
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+```{r load-libraries, include=FALSE}
+suppressPackageStartupMessages({
+  library(ChainLadder)
+  library(dplyr)
+  library(tidyr)
+  library(knitr)
+  library(kableExtra)
+  library(ggplot2)
+  library(shiny)
+  library(httr)
+  library(jsonlite)
+})
+```
+
+# Executive Summary
+
+This interactive report demonstrates an AI-augmented actuarial claims reserving analysis using the Chain Ladder method with scenario analysis, threshold-based uncertainty classification, and detailed pattern recognition. The analysis includes method suitability assessment and comparison with alternative approaches where appropriate.
+
+# Data Input Section
+```{r data-input, echo=FALSE}
+fluidRow(
+  column(12,
+    wellPanel(
+      h3("Data Input Options"),
+      radioButtons("data_source", "Select Data Source:",
+                   choices = c("Use Default GenIns Dataset" = "default",
+                              "Upload CSV File" = "upload"),
+                   selected = "default"),
+      
+      conditionalPanel(
+        condition = "input.data_source == 'upload'",
+        fileInput("file_upload", "Choose CSV File",
+                  accept = c("text/csv", "text/comma-separated-values,text/plain", ".csv")),
+        helpText("CSV should have origin years as rows and development periods as columns.")
+      ),
+      
+      hr(),
+      h4("Scenario Analysis Configuration"),
+      sliderInput("severity_shock", "Severity Shock (%):", 
+                  min = -20, max = 20, value = 10, step = 5),
+      sliderInput("dev_speed_shock", "Development Speed Shock (%):", 
+                  min = -10, max = 10, value = 5, step = 2.5),
+      checkboxInput("run_scenarios", "Run Scenario Analysis", value = TRUE),
+      
+      hr(),
+      h4("AI Configuration"),
+      selectInput("ai_provider", "Choose AI Provider:",
+                  choices = c("Ollama (FREE - Local)" = "ollama",
+                            "Anthropic Claude (Paid API)" = "anthropic",
+                            "No AI (Skip Analysis)" = "none"),
+                  selected = "ollama"),
+      
+      conditionalPanel(
+        condition = "input.ai_provider == 'ollama'",
+        div(
+          style = "background-color: #d4edda; padding: 15px; border-radius: 5px; margin: 10px 0;",
+          h5(style = "color: #155724; margin-top: 0;", "✓ FREE Local AI with Ollama"),
+          p(style = "color: #155724; margin-bottom: 5px;", strong("Quick Setup:")),
+          tags$ol(
+            style = "color: #155724; margin-bottom: 10px;",
+            tags$li("Download: ", tags$a(href = "https://ollama.com/download", target = "_blank", "ollama.com/download")),
+            tags$li("Open Terminal/PowerShell and run:", tags$br(), 
+                   tags$code("ollama serve"), tags$br(),
+                   tags$small("(Keep this terminal window open!)")),
+            tags$li("Open a NEW terminal and run:", tags$br(),
+                   tags$code("ollama pull llama3.2")),
+            tags$li("Click 'Test Ollama Connection' below before running analysis")
+          )
+        ),
+        actionButton("test_ollama", "Test Ollama Connection", class = "btn-info"),
+        textOutput("ollama_status"),
+        br(),
+        textInput("ollama_url", "Ollama Server URL:", 
+                  value = "http://localhost:11434",
+                  placeholder = "http://localhost:11434"),
+        selectInput("ollama_model", "Select Model:",
+                    choices = c("llama3.2" = "llama3.2",
+                              "llama3.1" = "llama3.1", 
+                              "llama2" = "llama2",
+                              "mistral" = "mistral",
+                              "phi3" = "phi3"),
+                    selected = "llama3.2")
+      ),
+      
+      conditionalPanel(
+        condition = "input.ai_provider == 'anthropic'",
+        div(
+          style = "background-color: #fff3cd; padding: 15px; border-radius: 5px; margin: 10px 0;",
+          p(style = "color: #856404; margin-bottom: 5px;", "⚠️ Requires paid API credits"),
+          p(style = "color: #856404; margin-bottom: 0;", "Get your API key from: ", 
+            tags$a(href = "https://console.anthropic.com/settings/keys", target = "_blank", 
+                   "console.anthropic.com"))
+        ),
+        passwordInput("api_key_input", "Enter Anthropic API Key:", 
+                      placeholder = "sk-ant-...")
+      ),
+      
+      conditionalPanel(
+        condition = "input.ai_provider == 'none'",
+        div(
+          style = "background-color: #e7f3ff; padding: 15px; border-radius: 5px; margin: 10px 0;",
+          p(style = "color: #004085;", "ℹ️ Analysis will run without AI-generated insights.")
+        )
+      ),
+      
+      hr(),
+      actionButton("run_analysis", "Run Analysis", class = "btn-primary btn-lg"),
+      hr(),
+      textOutput("data_status")
+    )
+  )
+)
+```
+```{r test-ollama-connection}
+observeEvent(input$test_ollama, {
+  
+  withProgress(message = 'Testing Ollama connection...', value = 0, {
+    
+    tryCatch({
+      response <- GET(
+        url = paste0(input$ollama_url, "/api/tags"),
+        timeout(10)
+      )
+      
+      if(status_code(response) == 200) {
+        content_data <- content(response, "parsed")
+        models <- sapply(content_data$models, function(x) x$name)
+        
+        if(input$ollama_model %in% models || any(grepl(input$ollama_model, models))) {
+          output$ollama_status <- renderText({
+            paste("✅ SUCCESS! Ollama is running and model", input$ollama_model, "is available.")
+          })
+          showNotification("Ollama connection successful!", type = "message", duration = 5)
+        } else {
+          output$ollama_status <- renderText({
+            paste0("⚠️ Ollama is running but model '", input$ollama_model, 
+                   "' not found. Available models: ", paste(models, collapse = ", "),
+                   "\n\nRun in terminal: ollama pull ", input$ollama_model)
+          })
+          showNotification(paste("Model", input$ollama_model, "not found. Please pull it first."), 
+                         type = "warning", duration = 10)
+        }
+      } else {
+        output$ollama_status <- renderText({
+          "❌ Ollama server responded but with an error. Make sure 'ollama serve' is running."
+        })
+      }
+      
+    }, error = function(e) {
+      output$ollama_status <- renderText({
+        paste0("❌ Cannot connect to Ollama at ", input$ollama_url, 
+               "\n\nMake sure you run 'ollama serve' in terminal first!\n\n",
+               "Error: ", e$message)
+      })
+      showNotification("Ollama connection failed! Run 'ollama serve' in terminal.", 
+                      type = "error", duration = 10)
+    })
+  })
+})
+```
+```{r reactive-data}
+triangle_data <- reactiveVal(NULL)
+analysis_triggered <- reactiveVal(FALSE)
+user_api_key <- reactiveVal("")
+
+observeEvent(input$api_key_input, {
+  user_api_key(input$api_key_input)
+})
+
+observeEvent(input$run_analysis, {
+  
+  if(input$data_source == "default") {
+    data(GenIns)
+    triangle_data(GenIns)
+    analysis_triggered(TRUE)
+    
+  } else if(input$data_source == "upload") {
+    req(input$file_upload)
+    
+    tryCatch({
+      uploaded <- read.csv(input$file_upload$datapath, row.names = 1)
+      triangle_data(as.triangle(as.matrix(uploaded)))
+      analysis_triggered(TRUE)
+    }, error = function(e) {
+      showNotification(paste("Error loading file:", e$message), type = "error")
+      analysis_triggered(FALSE)
+    })
+  }
+})
+
+output$data_status <- renderText({
+  if(!analysis_triggered()) {
+    "No data loaded. Please select a data source and click 'Run Analysis'."
+  } else {
+    paste("✓ Data loaded successfully! Triangle dimensions:", 
+          nrow(triangle_data()), "x", ncol(triangle_data()))
+  }
+})
+```
+```{r conditional-sections}
+output$show_sections <- reactive({
+  analysis_triggered()
+})
+outputOptions(output, "show_sections", suspendWhenHidden = FALSE)
+```
+
+# Method Selection & Suitability Assessment
+```{r method-selection-section}
+conditionalPanel(
+  condition = "output.show_sections",
+  uiOutput("method_selection_display")
+)
+```
+```{r assess-method-suitability}
+assess_cl_suitability <- function(triangle, cl_model, cl_summary) {
+  
+  # Calculate maturity for each origin year
+  paid_by_year <- cl_model$FullTriangle[, ncol(cl_model$FullTriangle)]
+  ultimate_by_year <- cl_summary$ByOrigin$Ultimate
+  pct_developed <- (paid_by_year / ultimate_by_year) * 100
+  
+  immature_years <- sum(pct_developed < 30, na.rm = TRUE)
+  
+  # Check CV volatility
+  cv_by_year <- (cl_summary$ByOrigin$Mack.S.E / cl_summary$ByOrigin$IBNR) * 100
+  high_cv_years <- sum(cv_by_year > 30, na.rm = TRUE)
+  
+  # Check development factor stability
+  dev_factors <- as.vector(cl_model$f)
+  df_cv <- sd(dev_factors, na.rm = TRUE) / mean(dev_factors, na.rm = TRUE) * 100
+  
+  # Red flags
+  red_flags <- list()
+  
+  if(immature_years > 2) {
+    red_flags <- c(red_flags, list(list(
+      flag = "Immature Data",
+      severity = "Medium",
+      description = paste0(immature_years, " origin year(s) are less than 30% developed"),
+      recommendation = "Consider Bornhuetter-Ferguson for recent accident years"
+    )))
+  }
+  
+  if(high_cv_years > 1) {
+    red_flags <- c(red_flags, list(list(
+      flag = "High Uncertainty",
+      severity = "Medium",
+      description = paste0(high_cv_years, " origin year(s) have CV > 30%"),
+      recommendation = "Review underlying data quality; consider segmentation"
+    )))
+  }
+  
+  if(df_cv > 25) {
+    red_flags <- c(red_flags, list(list(
+      flag = "Volatile Development Factors",
+      severity = "High",
+      description = paste0("Development factor CV = ", round(df_cv, 1), "% indicates instability"),
+      recommendation = "Investigate process changes or consider alternative methods"
+    )))
+  }
+  
+  # Check for exposure changes (simplified - based on paid trends)
+  if(nrow(triangle) >= 3) {
+    recent_paid <- sum(triangle[nrow(triangle), ], na.rm = TRUE)
+    earlier_paid <- sum(triangle[max(1, nrow(triangle)-2), ], na.rm = TRUE)
+    
+    if(abs(recent_paid / earlier_paid - 1) > 0.5) {
+      red_flags <- c(red_flags, list(list(
+        flag = "Potential Exposure Change",
+        severity = "High",
+        description = "Significant change in paid claims between recent origin years",
+        recommendation = "Verify if portfolio exposure has materially changed; if yes, use BF method"
+      )))
+    }
+  }
+  
+  list(
+    red_flags = red_flags,
+    immature_years = immature_years,
+    high_cv_years = high_cv_years,
+    df_cv = df_cv,
+    pct_developed = pct_developed
+  )
+}
+```
+```{r display-method-selection}
+output$method_selection_display <- renderUI({
+  req(analysis_triggered())
+  req(triangle_data())
+  
+  triangle <- triangle_data()
+  cl_model <- MackChainLadder(triangle, est.sigma = "Mack")
+  cl_summary <- summary(cl_model)
+  
+  suitability <- assess_cl_suitability(triangle, cl_model, cl_summary)
+  
+  div(
+    h2("Method Selection & Suitability Assessment"),
+    
+    div(
+      style = "background-color: #e7f3ff; padding: 20px; border-left: 4px solid #3498db; border-radius: 5px; margin-bottom: 20px;",
+      h4(style = "margin-top: 0; color: #004085;", "Chain Ladder Method Assumptions"),
+      p("The Chain Ladder method is appropriate when the following conditions hold:"),
+      tags$ul(
+        tags$li(strong("Stable development patterns: "), "Past claim development is representative of future patterns"),
+        tags$li(strong("Homogeneous portfolio: "), "No material changes in business mix, policy terms, or coverage"),
+        tags$li(strong("Consistent claims handling: "), "Settlement practices and claims processes remain stable"),
+        tags$li(strong("Proportional exposure: "), "No significant changes in premium volume or portfolio size"),
+        tags$li(strong("Sufficient maturity: "), "Adequate development history with low volatility")
+      ),
+      
+      p(style = "margin-top: 15px; margin-bottom: 0;",
+        strong("Important Note: "), 
+        "If exposure volumes, claim handling practices, policy conditions, or business mix have materially changed, ",
+        "Chain Ladder results may be biased. Alternative methods such as Bornhuetter-Ferguson should be considered in such cases.")
+    ),
+    
+    if(length(suitability$red_flags) > 0) {
+      div(
+        style = "background-color: #fff3cd; padding: 20px; border-left: 4px solid #ffc107; border-radius: 5px; margin-bottom: 20px;",
+        h4(style = "margin-top: 0; color: #856404;", 
+           "⚠️ Method Suitability Warnings (", length(suitability$red_flags), " issue", 
+           ifelse(length(suitability$red_flags) > 1, "s", ""), " detected)"),
+        
+        tags$table(
+          class = "table table-striped",
+          style = "margin-top: 15px;",
+          tags$thead(
+            tags$tr(
+              tags$th("Issue", style = "width: 25%;"),
+              tags$th("Severity", style = "width: 15%;"),
+              tags$th("Description", style = "width: 35%;"),
+              tags$th("Recommendation", style = "width: 25%;")
+            )
+          ),
+          tags$tbody(
+            lapply(suitability$red_flags, function(flag) {
+              severity_color <- ifelse(flag$severity == "High", "#dc3545", 
+                                      ifelse(flag$severity == "Medium", "#ffc107", "#28a745"))
+              tags$tr(
+                tags$td(flag$flag),
+                tags$td(tags$span(flag$severity, style = paste0("color: ", severity_color, "; font-weight: bold;"))),
+                tags$td(flag$description),
+                tags$td(flag$recommendation)
+              )
+            })
+          )
+        )
+      )
+    } else {
+      div(
+        style = "background-color: #d4edda; padding: 20px; border-left: 4px solid #28a745; border-radius: 5px; margin-bottom: 20px;",
+        h4(style = "margin-top: 0; color: #155724;", "✓ Chain Ladder Appears Suitable"),
+        p("No major red flags detected. The data appears suitable for Chain Ladder analysis based on automated checks.")
+      )
+    },
+    
+    h4("Alternative Methods for Comparison"),
+    div(
+      style = "background-color: #f8f9fa; padding: 20px; border-radius: 5px;",
+      tags$table(
+        class = "table table-bordered",
+        tags$thead(
+          tags$tr(
+            tags$th("Problem", style = "width: 30%;"),
+            tags$th("Better Method", style = "width: 25%;"),
+            tags$th("Why It Helps", style = "width: 45%;")
+          )
+        ),
+        tags$tbody(
+          tags$tr(
+            tags$td("Exposure change"),
+            tags$td(strong("Bornhuetter-Ferguson (BF)")),
+            tags$td("Separates a priori loss expectations from observed development; reduces bias from volume changes")
+          ),
+          tags$tr(
+            tags$td("Immature data"),
+            tags$td(strong("BF / Cape Cod")),
+            tags$td("Reduces reliance on unstable early development factors; blends prior knowledge with data")
+          ),
+          tags$tr(
+            tags$td("Claims process change"),
+            tags$td(strong("BF or segmentation")),
+            tags$td("Less sensitive to recent process distortions; segments isolate structural breaks")
+          ),
+          tags$tr(
+            tags$td("Volatile large losses"),
+            tags$td(strong("Large loss carve-out")),
+            tags$td("Prevents individual claims from distorting development patterns")
+          ),
+          tags$tr(
+            tags$td("Changing mix of business"),
+            tags$td(strong("Segmented triangles")),
+            tags$td("Restores homogeneity by analyzing similar cohorts separately")
+          ),
+          tags$tr(
+            tags$td("High uncertainty"),
+            tags$td(strong("Mack + stress testing")),
+            tags$td("Quantifies and communicates reserve risk explicitly")
+          )
+        )
+      ),
+      
+      p(style = "margin-top: 15px; font-style: italic; color: #666;",
+        strong("Note: "), "This analysis uses the Mack Chain Ladder as the primary method. ",
+        "In practice, actuaries should compare multiple methods (e.g., Chain Ladder vs. BF) and select ",
+        "the most appropriate based on data characteristics, business context, and professional judgment. ",
+        "The methods above provide a framework for such comparisons.")
+    )
+  )
+})
+```
+
+# Assumptions & Methodology
+```{r assumptions-section}
+conditionalPanel(
+  condition = "output.show_sections",
+  uiOutput("assumptions_display")
+)
+```
+```{r display-assumptions}
+output$assumptions_display <- renderUI({
+  req(analysis_triggered())
+  
+  HTML(paste0(
+    "<div style='background-color: #f8f9fa; padding: 20px; border-left: 4px solid #5bc0de; border-radius: 5px;'>",
+    "<h3 style='margin-top: 0; color: #31708f;'>Methodology & Key Assumptions</h3>",
+    
+    "<h4>Chain Ladder Method</h4>",
+    "<ul>",
+    "<li><strong>Development Factor Calculation:</strong> Volume-weighted age-to-age factors</li>",
+    "<li><strong>Standard Error Estimation:</strong> Mack (1993) method for measuring reserve uncertainty</li>",
+    "<li><strong>Independence Assumption:</strong> Accident years develop independently</li>",
+    "<li><strong>Projection Method:</strong> Full triangle projection to ultimate using iterative application of development factors</li>",
+    "<li><strong>Critical Limitation:</strong> Assumes past development patterns remain representative of future development</li>",
+    "</ul>",
+    
+    "<h4>Data Specifications</h4>",
+    "<ul>",
+    "<li><strong>Data Cut-off Date:</strong> ", format(Sys.Date(), '%B %d, %Y'), "</li>",
+    "<li><strong>Currency:</strong> Values in thousands (unless otherwise specified)</li>",
+    "<li><strong>Triangle Type:</strong> Paid claims development triangle</li>",
+    "<li><strong>No Manual Adjustments:</strong> Base case uses raw data without manual factor smoothing</li>",
+    "</ul>",
+    
+    "<h4>Uncertainty Classification Thresholds</h4>",
+    "<table class='table table-bordered' style='width: 70%; margin-top: 10px;'>",
+    "<thead><tr><th>Coefficient of Variation (CV)</th><th>Uncertainty Level</th><th>Interpretation</th></tr></thead>",
+    "<tbody>",
+    "<tr><td>< 10%</td><td><span style='color: #28a745; font-weight: bold;'>Low</span></td><td>High confidence in estimate</td></tr>",
+    "<tr><td>10% - 20%</td><td><span style='color: #ffc107; font-weight: bold;'>Moderate</span></td><td>Reasonable confidence, some variability expected</td></tr>",
+    "<tr><td>> 20%</td><td><span style='color: #dc3545; font-weight: bold;'>High</span></td><td>Significant uncertainty, requires detailed review</td></tr>",
+    "</tbody></table>",
+    
+    "<h4>Development Factor Interpretation</h4>",
+    "<table class='table table-bordered' style='width: 80%; margin-top: 10px;'>",
+    "<thead><tr><th>Development Factor</th><th>Classification</th><th>Interpretation</th></tr></thead>",
+    "<tbody>",
+    "<tr><td>> 1.20</td><td><span style='color: #dc3545; font-weight: bold;'>High</span></td><td>May indicate immature claims, process changes, or reporting delays — not necessarily higher ultimate losses</td></tr>",
+    "<tr><td>1.05 - 1.20</td><td><span style='color: #ffc107; font-weight: bold;'>Moderate</span></td><td>Normal development pattern for mid-stage claims</td></tr>",
+    "<tr><td>< 1.05</td><td><span style='color: #28a745; font-weight: bold;'>Low/Mature</span></td><td>Claims nearing full development; minimal future movement expected</td></tr>",
+    "</tbody></table>",
+    
+    "<p style='background-color: #fff3cd; padding: 12px; border-radius: 5px; margin-top: 15px;'>",
+    "<strong>⚠️ Important Actuarial Note:</strong> ",
+    "Development factors reflect <em>cumulative development speed</em>, not claim magnitude. ",
+    "A declining development factor pattern may indicate faster claim settlement, changes in reporting practices, ",
+    "improved claims handling efficiency, or reinsurance effects — rather than purely lower claim frequency or severity. ",
+    "Conversely, increasing factors may signal reporting delays or process slowdowns, not necessarily adverse development.",
+    "</p>",
+    
+    "<h4>Scenario Analysis Design</h4>",
+    "<ul>",
+    "<li><strong>Approach:</strong> Illustrative, deterministic stress testing</li>",
+    "<li><strong>Severity Shock:</strong> Uniform percentage change applied to all claim amounts across all origin years</li>",
+    "<li><strong>Development Speed Shock:</strong> Uniform percentage change applied to all development factors</li>",
+    "<li><strong>Limitation:</strong> Scenarios are symmetric and do not reflect year-specific or asymmetric shocks</li>",
+    "<li><strong>Enhancement Opportunity:</strong> More advanced stress testing could incorporate stochastic simulations, ",
+    "asymmetric shocks, or origin-year-specific adjustments based on exposure or claims experience</li>",
+    "</ul>",
+    
+    "<h4>Known Limitations & Caveats</h4>",
+    "<div style='background-color: #ffe5e5; padding: 15px; border-radius: 5px; margin-top: 10px;'>",
+    "<p style='margin-bottom: 8px;'><strong>This analysis does NOT account for:</strong></p>",
+    "<ul style='margin-bottom: 0;'>",
+    "<li>Material changes in exposure volume (premiums doubled/halved, portfolio growth/shrinkage)</li>",
+    "<li>Changes in claims handling systems or settlement speed (new systems, process reforms)</li>",
+    "<li>Changes in business mix (new products, different policy terms, geographic expansion)</li>",
+    "<li>Large loss concentration or catastrophe events that may distort development patterns</li>",
+    "<li>Regulatory changes, legal reforms, or external economic shocks</li>",
+    "</ul>",
+    "<p style='margin-top: 10px; margin-bottom: 0; font-style: italic;'>",
+    "If any of these conditions are present, the Chain Ladder estimates may be materially biased. ",
+    "Review the Method Suitability Assessment section and consider alternative approaches.",
+    "</p>",
+    "</div>",
+    
+    "<h4>Reproducibility & Audit Trail</h4>",
+    "<p style='margin-top: 15px; font-style: italic; color: #666;'>",
+    "All calculations follow the Mack Chain Ladder methodology as implemented in the ChainLadder R package (version ", 
+    as.character(packageVersion("ChainLadder")), "). ",
+    "Results are fully reproducible given the same input data. Development factors, standard errors, and ultimate projections ",
+    "are calculated according to Mack (1993) formulas. All code is available for audit and can be provided upon request.",
+    "</p>",
+    "</div>"
+  ))
+})
+```
+
+# Input Data
+```{r show-input-data, eval=TRUE}
+conditionalPanel(
+  condition = "output.show_sections",
+  
+  div(
+    h2("Input Data"),
+    
+    h3("Claims Triangle"),
+    uiOutput("triangle_display"),
+    
+    h3("Data Summary"),
+    uiOutput("summary_display")
+  )
+)
+```
+```{r display-triangle}
+output$triangle_display <- renderUI({
+  req(analysis_triggered())
+  req(triangle_data())
+  
+  triangle <- triangle_data()
+  triangle_df <- as.data.frame(as.matrix(triangle))
+  triangle_df <- cbind(Origin = rownames(triangle_df), triangle_df)
+  rownames(triangle_df) <- NULL
+  
+  kable(triangle_df, 
+        caption = "Claims Triangle (in thousands)",
+        format.args = list(big.mark = ",", scientific = FALSE),
+        align = c("l", rep("r", ncol(triangle)))) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE,
+                  position = "center",
+                  font_size = 12) %>%
+    HTML()
+})
+```
+```{r display-summary}
+output$summary_display <- renderUI({
+  req(analysis_triggered())
+  req(triangle_data())
+  
+  triangle <- triangle_data()
+  
+  summary_stats <- data.frame(
+    Metric = c("Origin Years", "Development Years", "Total Observations", 
+               "Minimum Value", "Maximum Value", "Mean Value"),
+    Value = c(
+      nrow(triangle),
+      ncol(triangle),
+      sum(!is.na(triangle)),
+      format(min(triangle, na.rm = TRUE), big.mark = ","),
+      format(max(triangle, na.rm = TRUE), big.mark = ","),
+      format(round(mean(as.matrix(triangle), na.rm = TRUE), 0), big.mark = ",")
+    )
+  )
+  
+  kable(summary_stats, 
+        caption = "Triangle Summary Statistics",
+        col.names = c("Metric", "Value"),
+        align = c("l", "r")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"),
+                  full_width = FALSE,
+                  position = "center") %>%
+    HTML()
+})
+```
+
+# AI-Generated Insights
+```{r ai-insights-section}
+conditionalPanel(
+  condition = "output.show_sections",
+  uiOutput("ai_insights_display")
+)
+```
+```{r pattern-analysis}
+analyze_patterns <- function(triangle, cl_model, cl_summary) {
+  
+  total_ibnr <- cl_summary$Totals["IBNR", ]
+  total_se <- cl_summary$Totals["Mack S.E", ]
+  cv <- total_se / total_ibnr * 100
+  latest <- cl_summary$Totals["Latest", ]
+  ultimate <- cl_summary$Totals["Ultimate", ]
+  reserve_ratio <- total_ibnr / latest * 100
+  
+  dev_factors <- as.vector(cl_model$f)
+  high_dfs <- which(dev_factors > 1.20)
+  moderate_dfs <- which(dev_factors >= 1.05 & dev_factors <= 1.20)
+  low_dfs <- which(dev_factors < 1.05)
+  
+  ibnr_by_year <- cl_summary$ByOrigin$IBNR
+  max_ibnr_idx <- which.max(ibnr_by_year[1:(length(ibnr_by_year)-1)])
+  max_ibnr_year <- rownames(cl_summary$ByOrigin)[max_ibnr_idx]
+  max_ibnr_value <- ibnr_by_year[max_ibnr_idx]
+  max_ibnr_pct <- (max_ibnr_value / total_ibnr) * 100
+  
+  cv_by_year <- (cl_summary$ByOrigin$Mack.S.E / cl_summary$ByOrigin$IBNR) * 100
+  high_uncertainty_years <- which(cv_by_year > 20)
+  
+  df_trend <- if(length(dev_factors) >= 3) {
+    recent_avg <- mean(dev_factors[(length(dev_factors)-2):length(dev_factors)])
+    early_avg <- mean(dev_factors[1:min(3, length(dev_factors))])
+    if(recent_avg < early_avg * 0.9) "declining" else if(recent_avg > early_avg * 1.1) "increasing" else "stable"
+  } else {
+    "stable"
+  }
+  
+  # Maturity assessment
+  paid_by_year <- cl_model$FullTriangle[, ncol(cl_model$FullTriangle)]
+  ultimate_by_year <- cl_summary$ByOrigin$Ultimate
+  pct_developed <- (paid_by_year / ultimate_by_year) * 100
+  immature_years <- sum(pct_developed < 30, na.rm = TRUE)
+  
+  list(
+    total_ibnr = total_ibnr,
+    total_se = total_se,
+    cv = cv,
+    latest = latest,
+    ultimate = ultimate,
+    reserve_ratio = reserve_ratio,
+    dev_factors = dev_factors,
+    high_dfs = high_dfs,
+    moderate_dfs = moderate_dfs,
+    low_dfs = low_dfs,
+    max_ibnr_year = max_ibnr_year,
+    max_ibnr_value = max_ibnr_value,
+    max_ibnr_pct = max_ibnr_pct,
+    high_uncertainty_years = high_uncertainty_years,
+    df_trend = df_trend,
+    immature_years = immature_years,
+    pct_developed = pct_developed
+  )
+}
+```
+```{r ai-analysis-function}
+get_ai_insights_ollama <- function(triangle, cl_model, cl_summary, patterns, suitability, ollama_url, model_name) {
+  
+  prompt <- paste0(
+    "You are a senior actuary performing a detailed Chain Ladder analysis. Provide specific, quantitative insights with explicit pattern recognition.\n\n",
+    
+    "=== KEY METRICS ===\n",
+    "Triangle: ", nrow(triangle), " origin years × ", ncol(triangle), " development periods\n",
+    "Latest Paid Claims: $", format(round(patterns$latest, 0), big.mark = ","), "\n",
+    "Ultimate Claims Projection: $", format(round(patterns$ultimate, 0), big.mark = ","), "\n",
+    "IBNR Reserve: $", format(round(patterns$total_ibnr, 0), big.mark = ","), "\n",
+    "Standard Error: $", format(round(patterns$total_se, 0), big.mark = ","), "\n",
+    "Coefficient of Variation: ", round(patterns$cv, 2), "%\n",
+    "Reserve-to-Paid Ratio: ", round(patterns$reserve_ratio, 1), "%\n\n",
+    
+    "=== UNCERTAINTY CLASSIFICATION ===\n",
+    "Based on CV = ", round(patterns$cv, 2), "%, this falls into: ",
+    ifelse(patterns$cv < 10, "LOW uncertainty (CV < 10%)", 
+           ifelse(patterns$cv < 20, "MODERATE uncertainty (10% ≤ CV < 20%)", 
+                  "HIGH uncertainty (CV ≥ 20%)")), "\n\n",
+    
+    "=== DEVELOPMENT FACTOR ANALYSIS ===\n",
+    "Development Factors: ", paste(round(patterns$dev_factors, 4), collapse = ", "), "\n",
+    "Trend: ", toupper(patterns$df_trend), "\n",
+    "High DFs (>1.20) at periods: ", if(length(patterns$high_dfs) > 0) paste(patterns$high_dfs, collapse = ", ") else "None", "\n",
+    "Moderate DFs (1.05-1.20) at periods: ", if(length(patterns$moderate_dfs) > 0) paste(patterns$moderate_dfs, collapse = ", ") else "None", "\n",
+    "Low/Mature DFs (<1.05) at periods: ", if(length(patterns$low_dfs) > 0) paste(patterns$low_dfs, collapse = ", ") else "None", "\n",
+    "IMPORTANT: Development factors reflect settlement speed, not claim size. ",
+    if(patterns$df_trend == "declining") {
+      "Declining DFs may indicate faster settlements, reporting improvements, or process efficiencies — not necessarily lower severities."
+    } else if(patterns$df_trend == "increasing") {
+      "Increasing DFs may signal reporting delays or slower settlements — not necessarily adverse claim development."
+    } else {
+      "Stable DFs suggest consistent claims handling patterns."
+    }, "\n\n",
+    
+    "=== MATURITY ASSESSMENT ===\n",
+    "Immature years (< 30% developed): ", patterns$immature_years, "\n",
+    if(patterns$immature_years > 2) {
+      "WARNING: Multiple immature years may make Chain Ladder unreliable. Consider Bornhuetter-Ferguson for recent years.\n"
+    } else {
+      "Maturity levels appear adequate for Chain Ladder.\n"
+    }, "\n",
+    
+    "=== IBNR CONCENTRATION ===\n",
+    "Largest IBNR: Origin Year ", patterns$max_ibnr_year, 
+    " = $", format(round(patterns$max_ibnr_value, 0), big.mark = ","), 
+    " (", round(patterns$max_ibnr_pct, 1), "% of total IBNR)\n",
+    "High Uncertainty Years (CV > 20%): ", if(length(patterns$high_uncertainty_years) > 0) 
+      paste(rownames(cl_summary$ByOrigin)[patterns$high_uncertainty_years], collapse = ", ") else "None", "\n\n",
+    
+    "=== METHOD SUITABILITY FLAGS ===\n",
+    if(length(suitability$red_flags) > 0) {
+      paste0("WARNINGS DETECTED (", length(suitability$red_flags), "):\n",
+            paste(sapply(suitability$red_flags, function(f) 
+              paste0("- ", f$flag, " (", f$severity, "): ", f$description)), collapse = "\n"), "\n\n")
+    } else {
+      "No method suitability warnings detected.\n\n"
+    },
+    
+    "=== REQUIRED ANALYSIS ===\n",
+    "Provide a professional actuarial analysis with:\n\n",
+    
+    "1. EXECUTIVE SUMMARY (3-4 sentences)\n",
+    "   - State the total IBNR with context (absolute value + reserve ratio)\n",
+    "   - Classify uncertainty level and explain why based on CV\n",
+    "   - Mention any method suitability concerns if present\n",
+    "   - Highlight the single most important finding\n\n",
+    
+    "2. DEVELOPMENT PATTERN INSIGHTS\n",
+    "   - Explain the trend (", patterns$df_trend, ") with CORRECT actuarial interpretation\n",
+    "   - Remember: DFs reflect development SPEED, not claim magnitude\n",
+    "   - Flag any high DFs (>1.20) with period numbers and possible causes\n",
+    "   - Note maturity indicators (low DFs at later periods)\n",
+    "   - Discuss what the pattern suggests about claims handling or reporting\n\n",
+    
+    "3. RESERVE CONCENTRATION & DATA QUALITY\n",
+    "   - Discuss origin year ", patterns$max_ibnr_year, " holding ", round(patterns$max_ibnr_pct, 1), "% of IBNR\n",
+    "   - Flag any years with high uncertainty (CV > 20%)\n",
+    "   - Assess concentration risk\n",
+    "   - Comment on data maturity issues if present\n\n",
+    
+    "4. METHOD APPROPRIATENESS & ALTERNATIVES\n",
+    "   - Is Chain Ladder appropriate for this data?\n",
+    "   - Should Bornhuetter-Ferguson be considered? (especially if immature years present)\n",
+    "   - Any concerns about exposure changes or mix shifts?\n\n",
+    
+    "5. ACTIONABLE RECOMMENDATIONS\n",
+    "   - Specific next steps based on the patterns observed\n",
+    "   - Data quality checks needed (if applicable)\n",
+    "   - Monitoring priorities\n",
+    "   - Alternative methods to consider\n\n",
+    
+    "Use specific numbers from the data above. Avoid generic statements. ",
+    "Each point should reference actual values or thresholds. Keep total response under 450 words but be specific and quantitative. ",
+    "Use professional actuarial language but explain technical points clearly."
+  )
+  
+  tryCatch({
+    test_response <- GET(url = paste0(ollama_url, "/api/tags"), timeout(5))
+    
+    if(status_code(test_response) != 200) {
+      return("❌ Ollama server not responding. Run 'ollama serve' in terminal.")
+    }
+    
+    response <- POST(
+      url = paste0(ollama_url, "/api/generate"),
+      body = toJSON(list(model = model_name, prompt = prompt, stream = FALSE), auto_unbox = TRUE),
+      encode = "json",
+      content_type_json(),
+      timeout(120)
+    )
+    
+    if(status_code(response) == 200) {
+      content_data <- content(response, "parsed")
+      return(content_data$response)
+    } else {
+      return(paste0("❌ Model '", model_name, "' not found. Run: ollama pull ", model_name))
+    }
+    
+  }, error = function(e) {
+    if(grepl("Timeout", e$message)) {
+      return("⏱️ AI taking too long. Wait 1-2 min and retry, or select 'No AI'.")
+    }
+    return(paste0("❌ Error: ", e$message, "\n\nRun: ollama serve"))
+  })
+}
+
+get_ai_insights_anthropic <- function(triangle, cl_model, cl_summary, patterns, suitability, api_key) {
+  
+  if(is.null(api_key) || api_key == "" || nchar(api_key) < 10) {
+    return("⚠️ Please enter your Anthropic API key above.")
+  }
+  
+  prompt <- paste0(
+    "You are a senior actuary. Provide detailed, quantitative Chain Ladder analysis with correct actuarial interpretation.\n\n",
+    
+    "KEY METRICS:\n",
+    "Triangle: ", nrow(triangle), " origin years × ", ncol(triangle), " periods\n",
+    "Latest Paid: $", format(round(patterns$latest, 0), big.mark = ","), "\n",
+    "Ultimate: $", format(round(patterns$ultimate, 0), big.mark = ","), "\n",
+    "IBNR: $", format(round(patterns$total_ibnr, 0), big.mark = ","), "\n",
+    "Std Error: $", format(round(patterns$total_se, 0), big.mark = ","), "\n",
+    "CV: ", round(patterns$cv, 2), "% (", 
+    ifelse(patterns$cv < 10, "LOW", ifelse(patterns$cv < 20, "MODERATE", "HIGH")), " uncertainty)\n",
+    "Reserve/Paid: ", round(patterns$reserve_ratio, 1), "%\n\n",
+    
+    "DEVELOPMENT FACTORS: ", paste(round(patterns$dev_factors, 4), collapse = ", "), "\n",
+    "Trend: ", toupper(patterns$df_trend), "\n",
+    "CRITICAL: DFs reflect SETTLEMENT SPEED, not claim magnitude. ",
+    if(patterns$df_trend == "declining") "Declining may = faster settlements/reporting, not lower claims." else 
+      if(patterns$df_trend == "increasing") "Increasing may = delays, not adverse development." else "Stable = consistent processes.", "\n",
+    "High DFs (>1.20): periods ", if(length(patterns$high_dfs) > 0) paste(patterns$high_dfs, collapse = ", ") else "None", "\n",
+    "Immature years (<30% developed): ", patterns$immature_years, 
+    if(patterns$immature_years > 2) " → Consider BF method" else "", "\n\n",
+    
+    "MAX IBNR: Year ", patterns$max_ibnr_year, " = $", format(round(patterns$max_ibnr_value, 0), big.mark = ","),
+    " (", round(patterns$max_ibnr_pct, 1), "% of total)\n\n",
+    
+    if(length(suitability$red_flags) > 0) {
+      paste0("METHOD WARNINGS (", length(suitability$red_flags), "):\n",
+            paste(sapply(suitability$red_flags, function(f) paste0("- ", f$flag)), collapse = "\n"), "\n\n")
+    } else {
+      ""
+    },
+    
+    "Provide:\n",
+    "1. Executive summary with specific numbers and method concerns\n",
+    "2. Development pattern insights (CORRECT interpretation of DFs)\n",
+    "3. Reserve concentration risks and data maturity\n",
+    "4. Method appropriateness (should we use BF instead?)\n",
+    "5. Actionable recommendations\n",
+    "Be specific and quantitative. Under 450 words."
+  )
+  
+  tryCatch({
+    response <- POST(
+      url = "https://api.anthropic.com/v1/messages",
+      add_headers(
+        "x-api-key" = api_key,
+        "anthropic-version" = "2023-06-01",
+        "content-type" = "application/json"
+      ),
+      body = toJSON(list(
+        model = "claude-sonnet-4-20250514",
+        max_tokens = 1500,
+        messages = list(list(role = "user", content = prompt))
+      ), auto_unbox = TRUE),
+      encode = "json"
+    )
+    
+    if(status_code(response) == 200) {
+      return(content(response, "parsed")$content[[1]]$text)
+    } else {
+      return(paste0("❌ API Error: ", status_code(response)))
+    }
+    
+  }, error = function(e) {
+    return(paste0("❌ Error: ", e$message))
+  })
+}
+```
+```{r display-ai-insights}
+output$ai_insights_display <- renderUI({
+  req(analysis_triggered())
+  req(triangle_data())
+  
+  triangle <- triangle_data()
+  cl_model <- MackChainLadder(triangle, est.sigma = "Mack")
+  cl_summary <- summary(cl_model)
+  
+  patterns <- analyze_patterns(triangle, cl_model, cl_summary)
+  suitability <- assess_cl_suitability(triangle, cl_model, cl_summary)
+  
+  if(input$ai_provider == "none") {
+    return(
+      wellPanel(
+        h3("ℹ️ AI Analysis Skipped", style = "color: #666;"),
+        p("You selected 'No AI'. The analysis has been completed without AI-generated insights.")
+      )
+    )
+  }
+  
+  withProgress(message = 'Generating detailed AI insights...', value = 0.5, {
+    
+    if(input$ai_provider == "ollama") {
+      insights <- get_ai_insights_ollama(triangle, cl_model, cl_summary, patterns, suitability,
+                                         input$ollama_url, input$ollama_model)
+      provider_label <- "🤖 AI-Powered Actuarial Analysis (FREE - Ollama Local)"
+      provider_color <- "#27ae60"
+    } else {
+      insights <- get_ai_insights_anthropic(triangle, cl_model, cl_summary, patterns, suitability,
+                                            user_api_key())
+      provider_label <- "🤖 AI-Powered Actuarial Analysis (Claude API)"
+      provider_color <- "#3498db"
+    }
+  })
+  
+  wellPanel(
+    h3(provider_label, style = paste0("color: ", provider_color, ";")),
+    HTML(paste0("<div style='background-color: #f8f9fa; padding: 20px; border-left: 4px solid ", 
+                provider_color, "; border-radius: 5px;'>",
+                "<pre style='white-space: pre-wrap; font-family: Arial, sans-serif; font-size: 14px; line-height: 1.6;'>",
+                insights,
+                "</pre></div>"))
+  )
+})
+```
+
+# Scenario Analysis
+```{r scenario-section}
+conditionalPanel(
+  condition = "output.show_sections && input.run_scenarios",
+  uiOutput("scenario_display")
+)
+```
+```{r run-scenarios}
+output$scenario_display <- renderUI({
+  req(analysis_triggered())
+  req(triangle_data())
+  req(input$run_scenarios)
+  
+  triangle <- triangle_data()
+  cl_base <- MackChainLadder(triangle, est.sigma = "Mack")
+  
+  triangle_sev <- triangle * (1 + input$severity_shock/100)
+  cl_sev <- MackChainLadder(triangle_sev, est.sigma = "Mack")
+  
+  cl_speed <- cl_base
+  cl_speed$f <- cl_base$f * (1 + input$dev_speed_shock/100)
+  triangle_speed <- triangle
+  for(i in 1:nrow(triangle)) {
+    for(j in 1:(ncol(triangle)-1)) {
+      if(!is.na(triangle[i,j]) && is.na(triangle[i,j+1])) {
+        triangle_speed[i,j+1] <- triangle[i,j] * cl_speed$f[j]
+      }
+    }
+  }
+  cl_speed <- MackChainLadder(triangle_speed, est.sigma = "Mack")
+  
+  base_ibnr <- summary(cl_base)$Totals["IBNR", ]
+  sev_ibnr <- summary(cl_sev)$Totals["IBNR", ]
+  speed_ibnr <- summary(cl_speed)$Totals["IBNR", ]
+  
+  base_cv <- (summary(cl_base)$Totals["Mack S.E", ] / base_ibnr) * 100
+  sev_cv <- (summary(cl_sev)$Totals["Mack S.E", ] / sev_ibnr) * 100
+  speed_cv <- (summary(cl_speed)$Totals["Mack S.E", ] / speed_ibnr) * 100
+  
+  scenario_df <- data.frame(
+    Scenario = c("Base Case", 
+                 paste0("Severity +", input$severity_shock, "%"),
+                 paste0("Dev Speed +", input$dev_speed_shock, "%")),
+    IBNR = c(base_ibnr, sev_ibnr, speed_ibnr),
+    Change_from_Base = c(0, sev_ibnr - base_ibnr, speed_ibnr - base_ibnr),
+    Pct_Change = c(0, ((sev_ibnr/base_ibnr - 1) * 100), ((speed_ibnr/base_ibnr - 1) * 100)),
+    CV = c(base_cv, sev_cv, speed_cv)
+  )
+  
+  div(
+    h2("Scenario Analysis Results"),
+    
+    div(
+      style = "background-color: #fff3cd; padding: 15px; border-left: 4px solid #ffc107; border-radius: 5px; margin-bottom: 20px;",
+      h5(style = "margin-top: 0; color: #856404;", "Scenario Design Limitations"),
+      p("These scenarios are illustrative and apply uniform, symmetric, deterministic shocks across all origin years. ",
+        "More advanced stress testing could incorporate asymmetric shocks, year-specific adjustments based on exposure changes, ",
+        "or stochastic simulations to better reflect real-world uncertainty.")
+    ),
+    
+    p(strong("Scenario Assumptions:")),
+    tags$ul(
+      tags$li("Severity Shock: ", input$severity_shock, "% uniform increase applied to all claim amounts across all origin years"),
+      tags$li("Development Speed Shock: ", input$dev_speed_shock, "% uniform increase applied to all development factors")
+    ),
+    
+    kable(scenario_df,
+          caption = "IBNR Reserve Sensitivity Analysis",
+          digits = c(0, 0, 0, 1, 2),
+          format.args = list(big.mark = ","),
+          col.names = c("Scenario", "IBNR Reserve", "Change ($)", "Change (%)", "CV (%)"),
+          align = c("l", "r", "r", "r", "r")) %>%
+      kable_styling(bootstrap_options = c("striped", "hover"),
+                    full_width = FALSE,
+                    position = "center") %>%
+      row_spec(1, bold = TRUE, background = "#e7f3ff") %>%
+      HTML(),
+    
+    br(),
+    
+    div(
+      style = "background-color: #d4edda; padding: 15px; border-radius: 5px; border-left: 4px solid #28a745;",
+      h4(style = "margin-top: 0; color: #155724;", "Scenario Interpretation"),
+      p(strong("Severity Shock Impact: "), 
+        ifelse(abs((sev_ibnr/base_ibnr - 1) * 100) < 5, "Low sensitivity",
+               ifelse(abs((sev_ibnr/base_ibnr - 1) * 100) < 15, "Moderate sensitivity", "High sensitivity")),
+        " - IBNR changes by ", round((sev_ibnr/base_ibnr - 1) * 100, 1), 
+        "% when severity increases by ", input$severity_shock, "%"),
+      p(strong("Development Speed Impact: "), 
+        ifelse(abs((speed_ibnr/base_ibnr - 1) * 100) < 5, "Low sensitivity",
+               ifelse(abs((speed_ibnr/base_ibnr - 1) * 100) < 15, "Moderate sensitivity", "High sensitivity")),
+        " - IBNR changes by ", round((speed_ibnr/base_ibnr - 1) * 100, 1), 
+        "% when development speeds up by ", input$dev_speed_shock, "%"),
+      p(style = "margin-bottom: 0;", em("These scenarios help quantify the impact of adverse developments and support capital planning and risk assessment."))
+    )
+  )
+})
+```
+
+# Chain Ladder Analysis
+```{r chain-ladder-section}
+conditionalPanel(
+  condition = "output.show_sections",
+  
+  div(
+    h2("Chain Ladder Analysis"),
+    
+    h3("Development Factors"),
+    uiOutput("dev_factors_display"),
+    
+    h3("Ultimate Claims and Reserves"),
+    uiOutput("reserves_display"),
+    uiOutput("total_reserve_display")
+  )
+)
+```
+```{r run-model-reactive}
+cl_results <- reactive({
+  req(analysis_triggered())
+  req(triangle_data())
+  
+  triangle <- triangle_data()
+  cl_model <- MackChainLadder(triangle, est.sigma = "Mack")
+  cl_summary <- summary(cl_model)
+  
+  list(model = cl_model, summary = cl_summary)
+})
+```
+```{r dev-factors-display}
+output$dev_factors_display <- renderUI({
+  req(cl_results())
+  
+  cl_model <- cl_results()$model
+  
+  f_vec <- as.vector(cl_model$f)
+  sigma_vec <- as.vector(cl_model$sigma)
+  min_len <- min(length(f_vec), length(sigma_vec))
+  
+  dev_factors <- data.frame(
+    Development_Period = paste(1:min_len, "to", 2:(min_len + 1)),
+    Factor = f_vec[1:min_len],
+    Std_Error = sigma_vec[1:min_len],
+    Classification = ifelse(f_vec[1:min_len] > 1.20, "High",
+                           ifelse(f_vec[1:min_len] >= 1.05, "Moderate", "Low/Mature"))
+  )
+  
+  kable(dev_factors, 
+        caption = "Age-to-Age Development Factors with Classifications",
+        digits = 4,
+        col.names = c("Development Period", "Factor", "Standard Error", "Classification"),
+        align = c("l", "r", "r", "c")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"),
+                  full_width = FALSE,
+                  position = "center") %>%
+    column_spec(4, bold = TRUE, 
+                color = ifelse(dev_factors$Classification == "High", "#dc3545",
+                              ifelse(dev_factors$Classification == "Moderate", "#ffc107", "#28a745"))) %>%
+    HTML()
+})
+```
+```{r reserves-display}
+output$reserves_display <- renderUI({
+  req(cl_results())
+  
+  cl_model <- cl_results()$model
+  cl_summary <- cl_results()$summary
+  
+  reserves_df <- data.frame(
+    Origin_Year = rownames(cl_summary$ByOrigin),
+    Latest_Paid = cl_model$FullTriangle[, ncol(cl_model$FullTriangle)],
+    Ultimate = cl_summary$ByOrigin$Ultimate,
+    IBNR = cl_summary$ByOrigin$IBNR,
+    Mack_SE = cl_summary$ByOrigin$Mack.S.E,
+    CV = (cl_summary$ByOrigin$Mack.S.E / cl_summary$ByOrigin$IBNR) * 100
+  )
+  
+  kable(reserves_df, 
+        caption = "IBNR Reserves by Origin Year with Uncertainty Metrics",
+        digits = c(0, 0, 0, 0, 0, 1),
+        format.args = list(big.mark = ","),
+        col.names = c("Origin Year", "Latest Paid", "Ultimate", 
+                      "IBNR Reserve", "Std Error", "CV (%)"),
+        align = c("l", "r", "r", "r", "r", "r")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"),
+                  full_width = FALSE,
+                  position = "center") %>%
+    row_spec(nrow(reserves_df), bold = TRUE, background = "#f0f0f0") %>%
+    HTML()
+})
+```
+```{r total-reserve-display}
+output$total_reserve_display <- renderUI({
+  req(cl_results())
+  
+  cl_summary <- cl_results()$summary
+  
+  total_ibnr <- cl_summary$Totals["IBNR", ]
+  total_se <- cl_summary$Totals["Mack S.E", ]
+  cv <- total_se / total_ibnr * 100
+  
+  uncertainty_class <- ifelse(cv < 10, "LOW", ifelse(cv < 20, "MODERATE", "HIGH"))
+  uncertainty_color <- ifelse(cv < 10, "#28a745", ifelse(cv < 20, "#ffc107", "#dc3545"))
+  
+  HTML(paste0(
+    "<div style='background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin-top: 20px;'>",
+    "<h4>Total Reserve Summary</h4>",
+    "<p><strong>Total IBNR Reserve:</strong> ", format(round(total_ibnr, 0), big.mark = ","), "</p>",
+    "<p><strong>Standard Error:</strong> ", format(round(total_se, 0), big.mark = ","), "</p>",
+    "<p><strong>Coefficient of Variation:</strong> ", round(cv, 2), "%</p>",
+    "<p><strong>Uncertainty Classification:</strong> <span style='color: ", uncertainty_color, "; font-weight: bold;'>",
+    uncertainty_class, "</span></p>",
+    "<p style='font-size: 0.9em; color: #666; margin-top: 15px;'>",
+    "Based on industry thresholds: Low (CV < 10%), Moderate (10% ≤ CV < 20%), High (CV ≥ 20%)",
+    "</p>",
+    "</div>"
+  ))
+})
+```
+
+# Visualizations
+```{r visualizations-section}
+conditionalPanel(
+  condition = "output.show_sections",
+  
+  div(
+    h2("Visualizations"),
+    
+    h3("Development Pattern"),
+    plotOutput("development_plot", width = "100%", height = "700px"),
+    
+    h3("IBNR Reserves by Origin Year"),
+    plotOutput("ibnr_plot", width = "100%", height = "600px"),
+    
+    h3("Paid Claims Heatmap"),
+    plotOutput("heatmap_plot", width = "100%", height = "600px"),
+    
+    h3("Development Factor Trend"),
+    plotOutput("factor_trend_plot", width = "100%", height = "600px")
+  )
+)
+```
+```{r development-plot-display}
+output$development_plot <- renderPlot({
+  req(cl_results())
+  plot(cl_results()$model, lattice = TRUE)
+})
+```
+```{r ibnr-plot-display}
+output$ibnr_plot <- renderPlot({
+  req(cl_results())
+  
+  cl_model <- cl_results()$model
+  cl_summary <- cl_results()$summary
+  
+  reserves_df <- data.frame(
+    Origin_Year = rownames(cl_summary$ByOrigin),
+    IBNR = cl_summary$ByOrigin$IBNR,
+    Mack_SE = cl_summary$ByOrigin$Mack.S.E
+  )
+  
+  plot_df <- reserves_df[1:(nrow(reserves_df)-1), ]
+  
+  ggplot(plot_df, aes(x = Origin_Year, y = IBNR)) +
+    geom_col(fill = "steelblue", alpha = 0.8) +
+    geom_errorbar(aes(ymin = pmax(0, IBNR - Mack_SE), ymax = IBNR + Mack_SE),
+                  width = 0.2, color = "red") +
+    theme_minimal() +
+    labs(title = "IBNR Reserves with Standard Error Bars",
+         x = "Origin Year",
+         y = "IBNR Reserve",
+         subtitle = "Red bars indicate ±1 standard error range") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, size = 10, color = "#666")) +
+    scale_y_continuous(labels = scales::comma)
+})
+```
+```{r heatmap-display}
+output$heatmap_plot <- renderPlot({
+  req(analysis_triggered())
+  req(triangle_data())
+  
+  triangle <- triangle_data()
+  triangle_matrix <- as.matrix(triangle)
+  triangle_long <- data.frame(
+    Origin = rep(rownames(triangle_matrix), times = ncol(triangle_matrix)),
+    Development = rep(1:ncol(triangle_matrix), each = nrow(triangle_matrix)),
+    Paid = as.vector(triangle_matrix)
+  )
+  
+  ggplot(triangle_long, aes(x = Development, y = Origin, fill = Paid)) +
+    geom_tile(color = "white", size = 0.5) +
+    scale_fill_gradient(low = "lightblue", high = "darkblue", 
+                        labels = scales::comma, na.value = "grey90") +
+    theme_minimal() +
+    labs(title = "Paid Claims Development Heatmap",
+         x = "Development Period",
+         y = "Origin Year",
+         fill = "Paid Amount",
+         subtitle = "Darker colors indicate higher claim amounts") +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, size = 10, color = "#666"))
+})
+```
+```{r factor-trend-display}
+output$factor_trend_plot <- renderPlot({
+  req(cl_results())
+  
+  cl_model <- cl_results()$model
+  
+  f_vec <- as.vector(cl_model$f)
+  sigma_vec <- as.vector(cl_model$sigma)
+  min_len <- min(length(f_vec), length(sigma_vec))
+  
+  dev_factors <- data.frame(
+    Development_Period = paste(1:min_len, "to", 2:(min_len + 1)),
+    Factor = f_vec[1:min_len],
+    Std_Error = sigma_vec[1:min_len],
+    Period = 1:min_len
+  )
+  
+  ggplot(dev_factors, aes(x = Period, y = Factor)) +
+    geom_line(color = "darkblue", size = 1.2) +
+    geom_point(color = "darkblue", size = 3) +
+    geom_ribbon(aes(ymin = Factor - Std_Error, ymax = Factor + Std_Error),
+                alpha = 0.2, fill = "blue") +
+    geom_hline(yintercept = 1.20, linetype = "dashed", color = "#dc3545", size = 0.8) +
+    geom_hline(yintercept = 1.05, linetype = "dashed", color = "#ffc107", size = 0.8) +
+    annotate("text", x = max(dev_factors$Period) * 0.9, y = 1.22, 
+             label = "High Threshold (1.20)", color = "#dc3545", size = 3) +
+    annotate("text", x = max(dev_factors$Period) * 0.9, y = 1.07, 
+             label = "Maturity Threshold (1.05)", color = "#ffc107", size = 3) +
+    theme_minimal() +
+    labs(title = "Age-to-Age Development Factors with Standard Error",
+         x = "Development Period",
+         y = "Development Factor",
+         subtitle = "Shaded area represents ±1 standard error; dashed lines show classification thresholds") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, size = 10, color = "#666")) +
+    scale_x_continuous(breaks = 1:nrow(dev_factors),
+                       labels = dev_factors$Development_Period) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+})
+```
+
+# Validation & Quality Checks
+```{r validation-section}
+conditionalPanel(
+  condition = "output.show_sections",
+  uiOutput("validation_display")
+)
+```
+```{r display-validation}
+output$validation_display <- renderUI({
+  req(cl_results())
+  req(triangle_data())
+  
+  triangle <- triangle_data()
+  cl_summary <- cl_results()$summary
+  
+  total_ibnr_calc <- sum(cl_summary$ByOrigin$IBNR, na.rm = TRUE)
+  total_ibnr_reported <- cl_summary$Totals["IBNR", ]
+  ibnr_match <- abs(total_ibnr_calc - total_ibnr_reported) < 0.01
+  
+  cv_values <- (cl_summary$ByOrigin$Mack.S.E / cl_summary$ByOrigin$IBNR) * 100
+  high_cv_count <- sum(cv_values > 20, na.rm = TRUE)
+  
+  dev_factors <- as.vector(cl_results()$model$f)
+  outlier_dfs <- sum(dev_factors > 1.20, na.rm = TRUE)
+  
+  completeness_pct <- (sum(!is.na(triangle)) / (nrow(triangle) * ncol(triangle))) * 100
+  
+  div(
+    h2("Validation & Quality Checks"),
+    
+    div(
+      style = "background-color: #d4edda; padding: 20px; border-left: 4px solid #28a745; border-radius: 5px; margin-bottom: 20px;",
+      h4(style = "margin-top: 0; color: #155724;", "✓ Automated Validation Results"),
+      
+      tags$table(
+        class = "table table-sm",
+        style = "width: 80%;",
+        tags$thead(
+          tags$tr(
+            tags$th("Check", style = "text-align: left;"),
+            tags$th("Result", style = "text-align: center;"),
+            tags$th("Status", style = "text-align: center;")
+          )
+        ),
+        tags$tbody(
+          tags$tr(
+            tags$td("IBNR Calculation Consistency"),
+            tags$td(ifelse(ibnr_match, "PASS", "FAIL"), style = "text-align: center;"),
+            tags$td(ifelse(ibnr_match, "✓", "✗"), 
+                   style = paste0("text-align: center; color: ", 
+                                ifelse(ibnr_match, "#28a745", "#dc3545"), "; font-weight: bold;"))
+          ),
+          tags$tr(
+            tags$td("Data Completeness"),
+            tags$td(paste0(round(completeness_pct, 1), "%"), style = "text-align: center;"),
+            tags$td(ifelse(completeness_pct > 50, "✓", "⚠"), 
+                   style = paste0("text-align: center; color: ", 
+                                ifelse(completeness_pct > 50, "#28a745", "#ffc107"), "; font-weight: bold;"))
+          ),
+          tags$tr(
+            tags$td("High Uncertainty Years (CV > 20%)"),
+            tags$td(paste0(high_cv_count, " year(s)"), style = "text-align: center;"),
+            tags$td(ifelse(high_cv_count == 0, "✓", "⚠"), 
+                   style = paste0("text-align: center; color: ", 
+                                ifelse(high_cv_count == 0, "#28a745", "#ffc107"), "; font-weight: bold;"))
+          ),
+          tags$tr(
+            tags$td("Outlier Development Factors (DF > 1.20)"),
+            tags$td(paste0(outlier_dfs, " period(s)"), style = "text-align: center;"),
+            tags$td(ifelse(outlier_dfs == 0, "✓", "⚠"), 
+                   style = paste0("text-align: center; color: ", 
+                                ifelse(outlier_dfs == 0, "#28a745", "#ffc107"), "; font-weight: bold;"))
+          )
+        )
+      ),
+      
+      if(high_cv_count > 0 || outlier_dfs > 0) {
+        p(style = "color: #856404; margin-top: 15px; font-weight: bold;",
+          "⚠ ATTENTION REQUIRED: ",
+          ifelse(high_cv_count > 0, 
+                 paste0(high_cv_count, " origin year(s) show high uncertainty (CV > 20%). "), ""),
+          ifelse(outlier_dfs > 0,
+                 paste0(outlier_dfs, " development factor(s) exceed threshold (>1.20). "), ""),
+          "Review AI insights and Method Suitability sections for detailed analysis.")
+      } else {
+        p(style = "color: #155724; margin-top: 15px;",
+          "All automated quality checks passed. Reserve estimates appear reasonable within expected parameters.")
+      }
+    ),
+    
+    h4("Recommended Next Steps"),
+    tags$ul(
+      tags$li(strong("Method Validation: "), "Consider comparing Chain Ladder results with Bornhuetter-Ferguson estimates as a reasonableness check"),
+      tags$li(strong("Data Quality Review: "), "Verify source data accuracy and completeness for flagged origin years"),
+      tags$li(strong("Expert Review: "), "Have senior actuaries review development factor outliers and high uncertainty years"),
+      tags$li(strong("Assumption Testing: "), "Validate that portfolio characteristics (exposure, mix, claims handling) have remained stable"),
+      tags$li(strong("Benchmarking: "), "Compare results against prior valuations, industry loss ratios, and actuarial expectations"),
+      tags$li(strong("Documentation: "), "Archive this analysis with supporting documentation for regulatory compliance and audit trail"),
+      if(input$run_scenarios) {
+        tags$li(strong("Scenario Discussion: "), "Present scenario analysis results to stakeholders for capital planning and risk assessment")
+      } else {
+        tags$li(strong("Scenario Testing: "), "Enable scenario analysis (checkbox in Data Input section) to assess sensitivity to adverse developments")
+      }
+    )
+  )
+})
+```
+
+# Conclusion
+```{r conclusion-section}
+conditionalPanel(
+  condition = "output.show_sections",
+  uiOutput("conclusion_display")
+)
+```
+```{r conclusion-display}
+output$conclusion_display <- renderUI({
+  req(cl_results())
+  req(triangle_data())
+  
+  triangle <- triangle_data()
+  cl_summary <- cl_results()$summary
+  
+  total_ibnr <- cl_summary$Totals["IBNR", ]
+  total_se <- cl_summary$Totals["Mack S.E", ]
+  cv <- total_se / total_ibnr * 100
+  
+  uncertainty_level <- ifelse(cv < 10, "low", ifelse(cv < 20, "moderate", "high"))
+  uncertainty_color <- ifelse(cv < 10, "#28a745", ifelse(cv < 20, "#ffc107", "#dc3545"))
+  
+  HTML(paste0(
+    "<div style='background-color: #f8f9fa; padding: 25px; border-radius: 5px;'>",
+    
+    "<p style='font-size: 1.1em;'>",
+    "This comprehensive Chain Ladder reserving analysis demonstrates a rigorous, quantitative approach to IBNR estimation ",
+    "with built-in validation, scenario testing, method suitability assessment, and AI-powered pattern recognition. ",
+    "The total estimated IBNR reserve is <strong style='font-size: 1.2em;'>", 
+    format(round(total_ibnr, 0), big.mark = ","), "</strong> ",
+    "with a coefficient of variation of <strong>", round(cv, 2), "%</strong>, ",
+    "classified as <strong style='color: ", uncertainty_color, ";'>", 
+    toupper(uncertainty_level), " uncertainty</strong> based on industry-standard thresholds.",
+    "</p>",
+    
+    "<h2>Key Findings</h2>",
+    "<div style='background-color: white; padding: 15px; border-left: 4px solid #3498db; margin: 15px 0;'>",
+    "<ul style='margin-bottom: 0;'>",
+    "<li><strong>Scope:</strong> Analysis covers ", nrow(triangle), " origin years across ", 
+    ncol(triangle), " development periods</li>",
+    "<li><strong>Ultimate Projection:</strong> $", 
+    format(round(cl_summary$Totals["Ultimate", ], 0), big.mark = ","), 
+    " in total projected claims</li>",
+    "<li><strong>Current Position:</strong> $", 
+    format(round(cl_summary$Totals["Latest", ], 0), big.mark = ","), 
+    " in paid claims to date</li>",
+    "<li><strong>Reserve Ratio:</strong> ", 
+    round(total_ibnr / cl_summary$Totals["Latest", ] * 100, 1), 
+    "% of paid claims held in reserve</li>",
+    if(input$run_scenarios) {
+      paste0("<li><strong>Scenario Testing:</strong> Sensitivity analysis completed for severity (±", 
+            input$severity_shock, "%) and development speed (±", input$dev_speed_shock, 
+            "%) scenarios - see Scenario Analysis section</li>")
+    } else {
+      ""
+    },
+    "</ul>",
+    "</div>",
+    
+    "<h2>Methodology & Professional Standards</h2>",
+    "<p>This analysis employs the Mack Chain Ladder method with the following features:</p>",
+    "<ul>",
+    "<li><strong>Development Factors:</strong> Volume-weighted age-to-age progression with statistical classification</li>",
+    "<li><strong>Uncertainty Quantification:</strong> Mack (1993) standard error estimation with threshold-based risk categorization</li>",
+    "<li><strong>Method Suitability Assessment:</strong> Automated screening for red flags (immature data, volatile factors, exposure changes)</li>",
+    "<li><strong>Pattern Recognition:</strong> AI-powered detection of outliers, trends, and concentration risks with actuarially correct interpretation</li>",
+    "<li><strong>Validation Framework:</strong> Built-in consistency checks and data quality assessment</li>",
+    "<li><strong>Scenario Analysis:</strong> Systematic stress testing for adverse development scenarios (illustrative, uniform shocks)</li>",
+    "<li><strong>Alternative Methods:</strong> Documentation of when Bornhuetter-Ferguson or other methods should be considered</li>",
+    "</ul>",
+    
+    "<h2>Important Limitations & Actuarial Judgment</h2>",
+    "<div style='background-color: #fff3cd; padding: 15px; border-radius: 5px; margin: 15px 0;'>",
+    "<p style='margin-bottom: 10px;'><strong>This analysis is subject to the following professional caveats:</strong></p>",
+    "<ul style='margin-bottom: 8px;'>",
+    "<li>Chain Ladder assumes stable development patterns and homogeneous portfolios — see Method Suitability section for assessment of these assumptions</li>",
+    "<li>Development factors reflect <em>settlement speed and reporting patterns</em>, not claim magnitude — interpretation requires actuarial judgment</li>",
+    "<li>Scenario analysis uses uniform, symmetric shocks — real adverse development may be asymmetric or concentrated in specific years</li>",
+    "<li>Results should be compared with alternative methods (e.g. Bornhuetter-Ferguson) and validated against pricing expectations and industry benchmarks</li>",
+    "<li>Final reserve selection requires professional actuarial judgment considering qualitative factors beyond this quantitative analysis</li>",
+    "</ul>",
+    "<p style='margin-bottom: 0; font-style: italic;'>",
+    "<strong>Human Judgment Required:</strong> This analysis provides quantitative inputs to the reserving process. ",
+    "Actuaries must exercise professional judgment in interpreting results, selecting final reserves, and communicating uncertainty to stakeholders.",
+    "</p>",
+    "</div>",
+    
+    "<h2>Audit Trail & Reproducibility</h2>",
+    "<p style='background-color: #e7f3ff; padding: 15px; border-radius: 5px;'>",
+    "All calculations are fully reproducible through the underlying R code using the ChainLadder package (version ", 
+    as.character(packageVersion("ChainLadder")), "). ",
+    "Development factors, ultimate projections, and uncertainty measures follow established actuarial standards (Mack 1993). ",
+    "See the <strong>Assumptions & Methodology</strong> section for complete documentation of all parameters, ",
+    "thresholds, and calculation methods. Source code available for audit upon request.",
+    "</p>",
+    
+    "<hr style='margin: 25px 0;'>",
+    
+    "<p style='text-align: center; color: #666; font-style: italic;'>",
+    "<strong>Report generated:</strong> ", format(Sys.time(), '%B %d, %Y at %I:%M %p'), "<br>",
+    "<strong>Analyst:</strong> Rohith Narayanan<br>",
+    "<strong>Method:</strong> Mack Chain Ladder with Method Suitability Assessment and AI-augmented Analysis<br>",
+    "<strong>Framework:</strong> Quantitative inputs for actuarial judgment — final reserves require professional review",
+    "</p>",
+    
+    "</div>"
+  ))
+})
+```
